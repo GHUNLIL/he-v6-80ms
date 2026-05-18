@@ -12,6 +12,9 @@ WG_ALLOWED_IPS="${WG_ALLOWED_IPS:-4.4.4.0/24}"
 WG_MTU="${WG_MTU:-1280}"
 PHANTUN_IMAGE="${PHANTUN_IMAGE:-ghcr.io/akafeng/phantun}"
 CONTAINER_NAME="${CONTAINER_NAME:-phantun-client}"
+PUBLIC_IF="${PUBLIC_IF:-}"
+PHANTUN_TUN_NAME="${PHANTUN_TUN_NAME:-tun0}"
+PHANTUN_CLIENT_TUN_NET_V6="${PHANTUN_CLIENT_TUN_NET_V6:-fcc8::/16}"
 
 WG_DIR="/etc/wireguard"
 WG_CONF="${WG_DIR}/${WG_IF}.conf"
@@ -78,6 +81,22 @@ ensure_tun_device() {
     modprobe tun || true
   fi
   [[ -e /dev/net/tun ]] || fatal "/dev/net/tun 不存在，Docker Phantun 无法创建 TUN 设备。"
+}
+
+detect_public_if() {
+  if [[ -n "${PUBLIC_IF}" ]]; then
+    printf '%s\n' "${PUBLIC_IF}"
+    return
+  fi
+
+  local detected_if
+  detected_if="$(ip -6 route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}')"
+  if [[ -z "${detected_if}" ]]; then
+    detected_if="$(ip route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}')"
+  fi
+
+  [[ -n "${detected_if}" ]] || fatal "无法自动识别公网出口网卡，请用 PUBLIC_IF=eth0 bash $0 指定。"
+  printf '%s\n' "${detected_if}"
 }
 
 extract_private_key_from_existing_conf() {
@@ -159,6 +178,7 @@ stop_old_services_and_free_port() {
   systemctl reset-failed "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
   wg-quick down "${WG_IF}" >/dev/null 2>&1 || true
   ip link show dev "${WG_IF}" >/dev/null 2>&1 && ip link delete dev "${WG_IF}" >/dev/null 2>&1 || true
+  ip link show dev "${PHANTUN_TUN_NAME}" >/dev/null 2>&1 && ip link delete dev "${PHANTUN_TUN_NAME}" >/dev/null 2>&1 || true
 
   if command -v fuser >/dev/null 2>&1; then
     fuser -k "${WG_PORT}/udp" >/dev/null 2>&1 || true
@@ -197,12 +217,30 @@ ensure_ip6tables_rule() {
   ip6tables -C "$@" 2>/dev/null || ip6tables -I "$@"
 }
 
+ensure_ip6tables_nat_rule() {
+  ip6tables -t nat -C "$@" 2>/dev/null || ip6tables -t nat -I "$@"
+}
+
+write_sysctl_forwarding() {
+  log "开启 IPv4/IPv6 内核转发。"
+  cat >/etc/sysctl.d/99-wg-phantun-forward.conf <<EOF
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+EOF
+  sysctl --system >/dev/null
+}
+
 apply_firewall_rules() {
+  local public_if
+  public_if="$(detect_public_if)"
   log "配置 FakeTCP RST 防护。"
   ensure_ip6tables_rule INPUT -p tcp --sport "${FAKETCP_PORT}" -j DROP
+  ensure_ip6tables_nat_rule POSTROUTING -s "${PHANTUN_CLIENT_TUN_NET_V6}" -o "${public_if}" -j MASQUERADE
 }
 
 install_rst_guard_service() {
+  local public_if
+  public_if="$(detect_public_if)"
   log "写入开机自动恢复 RST 防护规则的 systemd 服务。"
   cat > "${RST_GUARD_SERVICE}" <<EOF
 [Unit]
@@ -213,6 +251,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/bin/sh -c '/usr/sbin/ip6tables -C INPUT -p tcp --sport ${FAKETCP_PORT} -j DROP 2>/dev/null || /usr/sbin/ip6tables -I INPUT -p tcp --sport ${FAKETCP_PORT} -j DROP'
+ExecStart=/bin/sh -c '/usr/sbin/ip6tables -t nat -C POSTROUTING -s ${PHANTUN_CLIENT_TUN_NET_V6} -o ${public_if} -j MASQUERADE 2>/dev/null || /usr/sbin/ip6tables -t nat -I POSTROUTING -s ${PHANTUN_CLIENT_TUN_NET_V6} -o ${public_if} -j MASQUERADE'
 RemainAfterExit=yes
 
 [Install]
@@ -243,6 +282,7 @@ start_phantun_client() {
     -e RUN_MODE="client" \
     -e LOCAL_ADDR="0.0.0.0:${WG_PORT}" \
     -e REMOTE_ADDR="[${AWS_IPV6}]:${FAKETCP_PORT}" \
+    -e TUN_NAME="${PHANTUN_TUN_NAME}" \
     -e RUST_LOG="info" \
     "${PHANTUN_IMAGE}"
 }
@@ -277,6 +317,7 @@ main() {
   prompt_server_public_key
   prompt_aws_ipv6
   stop_old_services_and_free_port
+  write_sysctl_forwarding
   write_wireguard_conf
   apply_firewall_rules
   install_rst_guard_service
