@@ -155,7 +155,10 @@ prompt_aws_ipv6() {
 stop_old_services_and_free_port() {
   log "停止旧的 ${CONTAINER_NAME} 容器和 ${WG_IF} 接口，释放 UDP ${WG_PORT}。"
   docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+  systemctl stop "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+  systemctl reset-failed "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
   wg-quick down "${WG_IF}" >/dev/null 2>&1 || true
+  ip link show dev "${WG_IF}" >/dev/null 2>&1 && ip link delete dev "${WG_IF}" >/dev/null 2>&1 || true
 
   if command -v fuser >/dev/null 2>&1; then
     fuser -k "${WG_PORT}/udp" >/dev/null 2>&1 || true
