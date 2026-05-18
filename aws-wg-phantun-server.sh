@@ -4,14 +4,15 @@ set -Eeuo pipefail
 # AWS 服务端：WireGuard + Phantun(FakeTCP) 一键重构脚本
 # 适用：Debian / Ubuntu，需 root 运行
 
-SCRIPT_VERSION="2026-05-19.3"
+SCRIPT_VERSION="2026-05-19.4"
 WG_IF="${WG_IF:-wg0}"
 WG_PORT="${WG_PORT:-44055}"
 FAKETCP_PORT="${FAKETCP_PORT:-44445}"
 WG_ADDRESS="${WG_ADDRESS:-4.4.4.1/24}"
 CLIENT_WG_ALLOWED_IP="${CLIENT_WG_ALLOWED_IP:-4.4.4.2/32}"
 WG_MTU="${WG_MTU:-1280}"
-PHANTUN_IMAGE="${PHANTUN_IMAGE:-ghcr.io/akafeng/phantun}"
+PHANTUN_VERSION="${PHANTUN_VERSION:-v0.8.1}"
+PHANTUN_IMAGE="${PHANTUN_IMAGE:-local/phantun:${PHANTUN_VERSION}}"
 CONTAINER_NAME="${CONTAINER_NAME:-phantun-server}"
 PUBLIC_IF="${PUBLIC_IF:-}"
 PHANTUN_TUN_NAME="${PHANTUN_TUN_NAME:-tun0}"
@@ -57,9 +58,9 @@ require_debian_like() {
 
 apt_install_base() {
   export DEBIAN_FRONTEND=noninteractive
-  log "安装/确认基础组件：wireguard-tools、iptables、psmisc、curl、kmod、ping。"
+  log "安装/确认基础组件：wireguard-tools、iptables、psmisc、curl、kmod、ping、unzip。"
   apt-get update
-  apt-get install -y wireguard-tools iproute2 iptables psmisc curl ca-certificates kmod iputils-ping
+  apt-get install -y wireguard-tools iproute2 iptables psmisc curl ca-certificates kmod iputils-ping unzip
 }
 
 ensure_docker() {
@@ -82,6 +83,46 @@ ensure_tun_device() {
     modprobe tun || true
   fi
   [[ -e /dev/net/tun ]] || fatal "/dev/net/tun 不存在，Docker Phantun 无法创建 TUN 设备。"
+}
+
+phantun_target_triple() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf '%s\n' "x86_64-unknown-linux-musl" ;;
+    aarch64|arm64) printf '%s\n' "aarch64-unknown-linux-musl" ;;
+    armv7l) printf '%s\n' "armv7-unknown-linux-musleabihf" ;;
+    armv6l|arm) printf '%s\n' "arm-unknown-linux-musleabihf" ;;
+    i386|i686) printf '%s\n' "i686-unknown-linux-musl" ;;
+    *) fatal "不支持的 CPU 架构：$(uname -m)。请手动设置 Phantun release target。" ;;
+  esac
+}
+
+build_phantun_image() {
+  local target
+  local url
+  local build_dir
+
+  target="$(phantun_target_triple)"
+  url="https://github.com/dndx/phantun/releases/download/${PHANTUN_VERSION}/phantun_${target}.zip"
+
+  if docker image inspect "${PHANTUN_IMAGE}" >/dev/null 2>&1; then
+    log "Phantun 本地镜像已存在：${PHANTUN_IMAGE}"
+    return
+  fi
+
+  log "下载 Phantun ${PHANTUN_VERSION} (${target}) 并构建本地 Docker 镜像：${PHANTUN_IMAGE}。"
+  build_dir="$(mktemp -d)"
+  curl -fL "${url}" -o "${build_dir}/phantun.zip"
+  unzip -qo "${build_dir}/phantun.zip" -d "${build_dir}"
+  chmod +x "${build_dir}/phantun_client" "${build_dir}/phantun_server"
+
+  cat > "${build_dir}/Dockerfile" <<EOF
+FROM scratch
+COPY phantun_client /usr/local/bin/phantun-client
+COPY phantun_server /usr/local/bin/phantun-server
+EOF
+
+  docker build -t "${PHANTUN_IMAGE}" "${build_dir}"
+  rm -rf "${build_dir}"
 }
 
 detect_public_if() {
@@ -219,6 +260,10 @@ ensure_ip6tables_rule() {
   ip6tables -C "$@" 2>/dev/null || ip6tables -I "$@"
 }
 
+ensure_ip6tables_forward_rule() {
+  ip6tables -C FORWARD "$@" 2>/dev/null || ip6tables -I FORWARD "$@"
+}
+
 ensure_ip6tables_nat_rule() {
   ip6tables -t nat -C "$@" 2>/dev/null || ip6tables -t nat -I "$@"
 }
@@ -231,6 +276,8 @@ apply_firewall_rules() {
   ensure_iptables_rule filter FORWARD -o "${WG_IF}" -j ACCEPT
   ensure_iptables_rule filter FORWARD -i "${PHANTUN_TUN_NAME}" -j ACCEPT
   ensure_iptables_rule filter FORWARD -o "${PHANTUN_TUN_NAME}" -j ACCEPT
+  ensure_ip6tables_forward_rule -i "${public_if}" -o "${PHANTUN_TUN_NAME}" -j ACCEPT
+  ensure_ip6tables_forward_rule -i "${PHANTUN_TUN_NAME}" -o "${public_if}" -j ACCEPT
   ensure_ip6tables_rule INPUT -p tcp --dport "${FAKETCP_PORT}" -j DROP
   ensure_ip6tables_nat_rule PREROUTING -p tcp -i "${public_if}" --dport "${FAKETCP_PORT}" -j DNAT --to-destination "${PHANTUN_SERVER_TUN_PEER_V6}"
 }
@@ -251,6 +298,8 @@ ExecStart=/bin/sh -c '/usr/sbin/iptables -C FORWARD -i ${WG_IF} -j ACCEPT 2>/dev
 ExecStart=/bin/sh -c '/usr/sbin/iptables -C FORWARD -o ${WG_IF} -j ACCEPT 2>/dev/null || /usr/sbin/iptables -I FORWARD -o ${WG_IF} -j ACCEPT'
 ExecStart=/bin/sh -c '/usr/sbin/iptables -C FORWARD -i ${PHANTUN_TUN_NAME} -j ACCEPT 2>/dev/null || /usr/sbin/iptables -I FORWARD -i ${PHANTUN_TUN_NAME} -j ACCEPT'
 ExecStart=/bin/sh -c '/usr/sbin/iptables -C FORWARD -o ${PHANTUN_TUN_NAME} -j ACCEPT 2>/dev/null || /usr/sbin/iptables -I FORWARD -o ${PHANTUN_TUN_NAME} -j ACCEPT'
+ExecStart=/bin/sh -c '/usr/sbin/ip6tables -C FORWARD -i ${public_if} -o ${PHANTUN_TUN_NAME} -j ACCEPT 2>/dev/null || /usr/sbin/ip6tables -I FORWARD -i ${public_if} -o ${PHANTUN_TUN_NAME} -j ACCEPT'
+ExecStart=/bin/sh -c '/usr/sbin/ip6tables -C FORWARD -i ${PHANTUN_TUN_NAME} -o ${public_if} -j ACCEPT 2>/dev/null || /usr/sbin/ip6tables -I FORWARD -i ${PHANTUN_TUN_NAME} -o ${public_if} -j ACCEPT'
 ExecStart=/bin/sh -c '/usr/sbin/ip6tables -C INPUT -p tcp --dport ${FAKETCP_PORT} -j DROP 2>/dev/null || /usr/sbin/ip6tables -I INPUT -p tcp --dport ${FAKETCP_PORT} -j DROP'
 ExecStart=/bin/sh -c '/usr/sbin/ip6tables -t nat -C PREROUTING -p tcp -i ${public_if} --dport ${FAKETCP_PORT} -j DNAT --to-destination ${PHANTUN_SERVER_TUN_PEER_V6} 2>/dev/null || /usr/sbin/ip6tables -t nat -I PREROUTING -p tcp -i ${public_if} --dport ${FAKETCP_PORT} -j DNAT --to-destination ${PHANTUN_SERVER_TUN_PEER_V6}'
 RemainAfterExit=yes
@@ -269,8 +318,7 @@ start_wireguard() {
 }
 
 start_phantun_server() {
-  log "拉取 Phantun 镜像：${PHANTUN_IMAGE}。"
-  docker pull "${PHANTUN_IMAGE}"
+  build_phantun_image
 
   log "启动 Phantun 服务端容器：FakeTCP :${FAKETCP_PORT} -> UDP 127.0.0.1:${WG_PORT}。"
   docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
@@ -280,15 +328,15 @@ start_phantun_server() {
     --device=/dev/net/tun \
     --cap-add=NET_ADMIN \
     --restart=unless-stopped \
-    --env "RUN_MODE=server" \
-    --env "LOCAL_ADDR=${FAKETCP_PORT}" \
-    --env "REMOTE_ADDR=127.0.0.1:${WG_PORT}" \
-    --env "TUN_NAME=${PHANTUN_TUN_NAME}" \
-    --env "RUST_LOG=info" \
-    "${PHANTUN_IMAGE}"
+    "${PHANTUN_IMAGE}" \
+    /usr/local/bin/phantun-server \
+    --local "${FAKETCP_PORT}" \
+    --remote "127.0.0.1:${WG_PORT}" \
+    --tun "${PHANTUN_TUN_NAME}"
 
-  docker inspect "${CONTAINER_NAME}" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -q '^LOCAL_ADDR=' \
-    || fatal "Phantun 容器未写入 LOCAL_ADDR 环境变量，请检查 Docker 启动参数。"
+  sleep 1
+  [[ "$(docker inspect "${CONTAINER_NAME}" --format '{{.State.Running}}')" == "true" ]] \
+    || { docker logs "${CONTAINER_NAME}" 2>&1 || true; fatal "Phantun 服务端容器启动失败。"; }
 }
 
 show_status() {
