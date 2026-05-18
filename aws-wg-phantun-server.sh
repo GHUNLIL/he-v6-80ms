@@ -236,7 +236,7 @@ start_phantun_server() {
   log "拉取 Phantun 镜像：${PHANTUN_IMAGE}。"
   docker pull "${PHANTUN_IMAGE}"
 
-  log "启动 Phantun 服务端容器：FakeTCP [::]:${FAKETCP_PORT} -> UDP 127.0.0.1:${WG_PORT}。"
+  log "启动 Phantun 服务端容器：FakeTCP :${FAKETCP_PORT} -> UDP 127.0.0.1:${WG_PORT}。"
   docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
   docker run -d \
     --name "${CONTAINER_NAME}" \
@@ -244,9 +244,11 @@ start_phantun_server() {
     --device=/dev/net/tun \
     --cap-add=NET_ADMIN \
     --restart=unless-stopped \
-    "${PHANTUN_IMAGE}" \
-    --local "127.0.0.1:${WG_PORT}" \
-    --listen "[::]:${FAKETCP_PORT}"
+    -e RUN_MODE="server" \
+    -e LOCAL_ADDR="${FAKETCP_PORT}" \
+    -e REMOTE_ADDR="127.0.0.1:${WG_PORT}" \
+    -e RUST_LOG="info" \
+    "${PHANTUN_IMAGE}"
 }
 
 show_status() {

@@ -240,9 +240,11 @@ start_phantun_client() {
     --device=/dev/net/tun \
     --cap-add=NET_ADMIN \
     --restart=unless-stopped \
-    "${PHANTUN_IMAGE}" \
-    --local "0.0.0.0:${WG_PORT}" \
-    --remote "[${AWS_IPV6}]:${FAKETCP_PORT}"
+    -e RUN_MODE="client" \
+    -e LOCAL_ADDR="0.0.0.0:${WG_PORT}" \
+    -e REMOTE_ADDR="[${AWS_IPV6}]:${FAKETCP_PORT}" \
+    -e RUST_LOG="info" \
+    "${PHANTUN_IMAGE}"
 }
 
 show_status_and_test() {
