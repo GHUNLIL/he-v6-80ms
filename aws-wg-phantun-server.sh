@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # AWS 服务端：WireGuard + Phantun(FakeTCP) 一键重构脚本
 # 适用：Debian / Ubuntu，需 root 运行
 
-SCRIPT_VERSION="2026-05-19.4"
+SCRIPT_VERSION="2026-05-19.5"
 WG_IF="${WG_IF:-wg0}"
 WG_PORT="${WG_PORT:-44055}"
 FAKETCP_PORT="${FAKETCP_PORT:-44445}"
@@ -143,14 +143,14 @@ detect_public_if() {
 
 extract_private_key_from_existing_conf() {
   [[ -r "${WG_CONF}" ]] || return 1
-  awk -F'= *' '/^[[:space:]]*PrivateKey[[:space:]]*=/{print $2; exit}' "${WG_CONF}"
+  awk '/^[[:space:]]*PrivateKey[[:space:]]*=/{sub(/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*/, ""); print; exit}' "${WG_CONF}"
 }
 
 extract_first_peer_public_key_from_existing_conf() {
   [[ -r "${WG_CONF}" ]] || return 1
   awk -F'= *' '
     /^\[Peer\]/{in_peer=1; next}
-    in_peer && /^[[:space:]]*PublicKey[[:space:]]*=/{print $2; exit}
+    in_peer && /^[[:space:]]*PublicKey[[:space:]]*=/{sub(/^[[:space:]]*PublicKey[[:space:]]*=[[:space:]]*/, ""); print; exit}
   ' "${WG_CONF}"
 }
 
