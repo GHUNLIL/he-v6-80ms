@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # MKCloud 客户端：WireGuard + Phantun(FakeTCP) 一键重构脚本
 # 适用：Debian / Ubuntu，需 root 运行
 
-SCRIPT_VERSION="2026-05-19.5"
+SCRIPT_VERSION="2026-05-19.6"
 WG_IF="${WG_IF:-wg0}"
 WG_PORT="${WG_PORT:-44055}"
 FAKETCP_PORT="${FAKETCP_PORT:-44445}"
@@ -271,6 +271,7 @@ write_sysctl_forwarding() {
   log "开启 IPv4/IPv6 内核转发。"
   cat >/etc/sysctl.d/99-wg-phantun-forward.conf <<EOF
 net.ipv4.ip_forward=1
+net.ipv4.icmp_echo_ignore_all=0
 net.ipv6.conf.all.forwarding=1
 EOF
   sysctl --system >/dev/null
