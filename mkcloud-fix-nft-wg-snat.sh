@@ -110,12 +110,20 @@ EOF
   nft -f "${CONF_FILE}"
 }
 
+restore_phantun_rst_guard() {
+  systemctl restart phantun-rst-guard-client.service >/dev/null 2>&1 || true
+  ip6tables -C INPUT -p tcp --sport 44445 -j DROP 2>/dev/null \
+    || ip6tables -I INPUT -p tcp --sport 44445 -j DROP
+}
+
 main() {
   require_root
   command -v nft >/dev/null 2>&1 || fatal "nft 命令不存在，请先安装 nftables。"
   rewrite_conf
+  restore_phantun_rst_guard
   log "已修复 ${CONF_FILE} 并加载 nftables。当前规则："
   nft list table ip "${TABLE_NAME}"
+  log "已恢复 Phantun FakeTCP RST 防护：ip6tables INPUT tcp --sport 44445 DROP。"
 }
 
 main "$@"
