@@ -4,6 +4,7 @@ set -Eeuo pipefail
 # MKCloud 客户端：WireGuard + Phantun(FakeTCP) 一键重构脚本
 # 适用：Debian / Ubuntu，需 root 运行
 
+SCRIPT_VERSION="2026-05-19.3"
 WG_IF="${WG_IF:-wg0}"
 WG_PORT="${WG_PORT:-44055}"
 FAKETCP_PORT="${FAKETCP_PORT:-44445}"
@@ -279,12 +280,15 @@ start_phantun_client() {
     --device=/dev/net/tun \
     --cap-add=NET_ADMIN \
     --restart=unless-stopped \
-    -e RUN_MODE="client" \
-    -e LOCAL_ADDR="0.0.0.0:${WG_PORT}" \
-    -e REMOTE_ADDR="[${AWS_IPV6}]:${FAKETCP_PORT}" \
-    -e TUN_NAME="${PHANTUN_TUN_NAME}" \
-    -e RUST_LOG="info" \
+    --env "RUN_MODE=client" \
+    --env "LOCAL_ADDR=0.0.0.0:${WG_PORT}" \
+    --env "REMOTE_ADDR=[${AWS_IPV6}]:${FAKETCP_PORT}" \
+    --env "TUN_NAME=${PHANTUN_TUN_NAME}" \
+    --env "RUST_LOG=info" \
     "${PHANTUN_IMAGE}"
+
+  docker inspect "${CONTAINER_NAME}" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -q '^LOCAL_ADDR=' \
+    || fatal "Phantun 容器未写入 LOCAL_ADDR 环境变量，请检查 Docker 启动参数。"
 }
 
 show_status_and_test() {
@@ -302,6 +306,7 @@ show_status_and_test() {
 }
 
 main() {
+  log "脚本版本：${SCRIPT_VERSION}"
   require_root
   require_debian_like
   apt_install_base
