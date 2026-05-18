@@ -7,6 +7,8 @@ set -Eeuo pipefail
 
 CONF_FILE="${CONF_FILE:-/etc/nftables.d/port-forward.conf}"
 TABLE_NAME="${TABLE_NAME:-port_forward}"
+WG_CONF="${WG_CONF:-/etc/wireguard/wg0.conf}"
+WG_MTU="${WG_MTU:-1380}"
 
 log() {
   printf '\033[1;32m[INFO]\033[0m %s\n' "$*"
@@ -116,14 +118,41 @@ restore_phantun_rst_guard() {
     || ip6tables -I INPUT -p tcp --sport 44445 -j DROP
 }
 
+ensure_wg_mtu() {
+  local tmp_file
+
+  [[ -f "${WG_CONF}" ]] || return 0
+  cp -a "${WG_CONF}" "${WG_CONF}.bak.$(date +%Y%m%d_%H%M%S)"
+  tmp_file="${WG_CONF}.tmp.$$"
+
+  awk -v mtu="${WG_MTU}" '
+    /^[[:space:]]*MTU[[:space:]]*=/ { next }
+    /^\[Interface\]/ {
+      print
+      print "MTU = " mtu
+      next
+    }
+    { print }
+  ' "${WG_CONF}" > "${tmp_file}"
+
+  mv -f "${tmp_file}" "${WG_CONF}"
+  chmod 600 "${WG_CONF}"
+
+  if ip link show wg0 >/dev/null 2>&1; then
+    ip link set mtu "${WG_MTU}" dev wg0
+  fi
+}
+
 main() {
   require_root
   command -v nft >/dev/null 2>&1 || fatal "nft 命令不存在，请先安装 nftables。"
   rewrite_conf
+  ensure_wg_mtu
   restore_phantun_rst_guard
   log "已修复 ${CONF_FILE} 并加载 nftables。当前规则："
   nft list table ip "${TABLE_NAME}"
   log "已恢复 Phantun FakeTCP RST 防护：ip6tables INPUT tcp --sport 44445 DROP。"
+  log "已确保 WireGuard MTU = ${WG_MTU}，用于承载 Hysteria2/QUIC 1280 字节初始包。"
 }
 
 main "$@"
