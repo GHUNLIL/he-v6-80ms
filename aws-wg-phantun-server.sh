@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # AWS 服务端：WireGuard + Phantun(FakeTCP) 一键重构脚本
 # 适用：Debian / Ubuntu，需 root 运行
 
-SCRIPT_VERSION="2026-05-19.7"
+SCRIPT_VERSION="2026-05-19.8"
 WG_IF="${WG_IF:-wg0}"
 WG_PORT="${WG_PORT:-44055}"
 FAKETCP_PORT="${FAKETCP_PORT:-44445}"
@@ -17,6 +17,7 @@ CONTAINER_NAME="${CONTAINER_NAME:-phantun-server}"
 PUBLIC_IF="${PUBLIC_IF:-}"
 PHANTUN_TUN_NAME="${PHANTUN_TUN_NAME:-tun0}"
 PHANTUN_SERVER_TUN_PEER_V6="${PHANTUN_SERVER_TUN_PEER_V6:-fcc9::2}"
+IFACE_TXQUEUELEN="${IFACE_TXQUEUELEN:-10000}"
 
 WG_DIR="/etc/wireguard"
 WG_CONF="${WG_DIR}/${WG_IF}.conf"
@@ -211,13 +212,34 @@ stop_old_services_and_free_port() {
 }
 
 write_sysctl_forwarding() {
-  log "开启 IPv4 内核转发。"
+  log "开启内核转发并优化高吞吐 UDP/FakeTCP 缓冲。"
   cat >/etc/sysctl.d/99-wg-phantun-forward.conf <<EOF
 net.ipv4.ip_forward=1
 net.ipv4.icmp_echo_ignore_all=0
 net.ipv6.conf.all.forwarding=1
+net.core.rmem_max=268435456
+net.core.wmem_max=268435456
+net.core.rmem_default=16777216
+net.core.wmem_default=16777216
+net.core.optmem_max=67108864
+net.core.netdev_max_backlog=250000
+net.ipv4.udp_rmem_min=16384
+net.ipv4.udp_wmem_min=16384
+net.ipv4.tcp_rmem=4096 87380 268435456
+net.ipv4.tcp_wmem=4096 65536 268435456
 EOF
   sysctl --system >/dev/null
+}
+
+apply_interface_queue_tuning() {
+  local public_if
+  public_if="$(detect_public_if)"
+  log "设置接口队列长度，减少高 PPS UDP 压测时的突发丢包。"
+  ip link set dev "${public_if}" txqueuelen "${IFACE_TXQUEUELEN}" >/dev/null 2>&1 || true
+  ip link show dev "${WG_IF}" >/dev/null 2>&1 \
+    && ip link set dev "${WG_IF}" txqueuelen "${IFACE_TXQUEUELEN}" >/dev/null 2>&1 || true
+  ip link show dev "${PHANTUN_TUN_NAME}" >/dev/null 2>&1 \
+    && ip link set dev "${PHANTUN_TUN_NAME}" txqueuelen "${IFACE_TXQUEUELEN}" >/dev/null 2>&1 || true
 }
 
 write_wireguard_conf() {
@@ -316,6 +338,7 @@ start_wireguard() {
   log "启动并设为开机自启：wg-quick@${WG_IF}。"
   systemctl enable "wg-quick@${WG_IF}"
   systemctl restart "wg-quick@${WG_IF}"
+  apply_interface_queue_tuning
 }
 
 start_phantun_server() {
@@ -338,6 +361,7 @@ start_phantun_server() {
   sleep 1
   [[ "$(docker inspect "${CONTAINER_NAME}" --format '{{.State.Running}}')" == "true" ]] \
     || { docker logs "${CONTAINER_NAME}" 2>&1 || true; fatal "Phantun 服务端容器启动失败。"; }
+  apply_interface_queue_tuning
 }
 
 show_status() {
