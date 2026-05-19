@@ -38,6 +38,88 @@ fatal() {
   exit 1
 }
 
+read_tty() {
+  local __var="$1"
+  local prompt="$2"
+  local input=""
+
+  if [[ -e /dev/tty ]]; then
+    read -r -p "${prompt}" input </dev/tty
+  else
+    read -r -p "${prompt}" input
+  fi
+  printf -v "${__var}" '%s' "${input}"
+}
+
+prompt_value() {
+  local __var="$1"
+  local label="$2"
+  local default_value="${3:-}"
+  local input=""
+
+  read_tty input "${label} [${default_value}]: "
+  printf -v "${__var}" '%s' "${input:-${default_value}}"
+}
+
+pause_ui() {
+  local _
+  read_tty _ "按回车继续..."
+}
+
+choose_menu() {
+  local title="$1"
+  shift
+  local options=("$@")
+  local selected=0
+  local key rest
+
+  if [[ ! -e /dev/tty ]]; then
+    local i choice
+    printf '\n%s\n' "${title}"
+    for i in "${!options[@]}"; do
+      printf '  %s) %s\n' "$((i + 1))" "${options[$i]}"
+    done
+    read_tty choice "请选择 [1-${#options[@]}]: "
+    [[ "${choice}" =~ ^[0-9]+$ ]] || return 1
+    (( choice >= 1 && choice <= ${#options[@]} )) || return 1
+    MENU_CHOICE=$((choice - 1))
+    return 0
+  fi
+
+  while true; do
+    clear >/dev/tty 2>/dev/null || true
+    {
+      printf '%s\n' "========================================"
+      printf '   AWS WireGuard + Phantun 服务端\n'
+      printf '   version: %s\n' "${SCRIPT_VERSION}"
+      printf '%s\n' "========================================"
+      printf '使用 ↑/↓ 选择，Enter 确认。\n\n'
+      for key in "${!options[@]}"; do
+        if [[ "${key}" -eq "${selected}" ]]; then
+          printf '  \033[7m> %s\033[0m\n' "${options[$key]}"
+        else
+          printf '    %s\n' "${options[$key]}"
+        fi
+      done
+    } >/dev/tty
+
+    IFS= read -rsn1 key </dev/tty || return 1
+    case "${key}" in
+      $'\x1b')
+        IFS= read -rsn2 -t 0.1 rest </dev/tty || rest=""
+        case "${rest}" in
+          "[A") (( selected > 0 )) && selected=$((selected - 1)) ;;
+          "[B") (( selected < ${#options[@]} - 1 )) && selected=$((selected + 1)) ;;
+        esac
+        ;;
+      "")
+        MENU_CHOICE="${selected}"
+        return 0
+        ;;
+    esac
+  done
+}
+
 on_error() {
   fatal "脚本执行失败，出错行号：$1。请查看上方日志。"
 }
@@ -188,10 +270,10 @@ prompt_client_public_key() {
   fi
 
   if [[ -n "${default_peer_key}" ]]; then
-    read -r -p "请输入 MKCloud 客户端 WireGuard 公钥 [回车复用现有值]: " CLIENT_PUBLIC_KEY_INPUT
+    read_tty CLIENT_PUBLIC_KEY_INPUT "请输入 MKCloud 客户端 WireGuard 公钥 [回车复用现有值]: "
     CLIENT_PUBLIC_KEY="${CLIENT_PUBLIC_KEY_INPUT:-$default_peer_key}"
   else
-    read -r -p "请输入 MKCloud 客户端 WireGuard 公钥: " CLIENT_PUBLIC_KEY
+    read_tty CLIENT_PUBLIC_KEY "请输入 MKCloud 客户端 WireGuard 公钥: "
   fi
 
   [[ -n "${CLIENT_PUBLIC_KEY}" ]] || fatal "客户端 WireGuard 公钥不能为空。"
@@ -374,16 +456,51 @@ show_status() {
   log "完成。请确认 AWS 安全组放行 IPv6 TCP ${FAKETCP_PORT} 入站。"
 }
 
-main() {
+configure_custom() {
+  clear >/dev/tty 2>/dev/null || true
+  log "自定义 AWS 服务端参数。直接回车会使用括号内默认值。"
+  prompt_value WG_IF "WireGuard 接口名" "${WG_IF}"
+  prompt_value WG_PORT "WireGuard 本地 UDP 端口" "${WG_PORT}"
+  prompt_value FAKETCP_PORT "公网 FakeTCP 端口" "${FAKETCP_PORT}"
+  prompt_value WG_ADDRESS "AWS WireGuard 地址/CIDR" "${WG_ADDRESS}"
+  prompt_value CLIENT_WG_ALLOWED_IP "客户端 WireGuard AllowedIPs" "${CLIENT_WG_ALLOWED_IP}"
+  prompt_value WG_MTU "WireGuard MTU" "${WG_MTU}"
+  prompt_value PUBLIC_IF "公网网卡，留空自动识别" "${PUBLIC_IF}"
+  prompt_value PHANTUN_TUN_NAME "Phantun TUN 名称" "${PHANTUN_TUN_NAME}"
+  prompt_value PHANTUN_SERVER_TUN_PEER_V6 "Phantun 服务端 TUN peer IPv6" "${PHANTUN_SERVER_TUN_PEER_V6}"
+  prompt_value PHANTUN_VERSION "Phantun 版本" "${PHANTUN_VERSION}"
+  PHANTUN_IMAGE="${PHANTUN_IMAGE:-local/phantun:${PHANTUN_VERSION}}"
+  prompt_value PHANTUN_IMAGE "Phantun Docker 镜像名" "${PHANTUN_IMAGE}"
+  prompt_value CONTAINER_NAME "Docker 容器名" "${CONTAINER_NAME}"
+  prompt_value IFACE_TXQUEUELEN "接口 txqueuelen" "${IFACE_TXQUEUELEN}"
+}
+
+print_config() {
+  cat <<EOF
+
+[当前 AWS 服务端参数]
+WG_IF=${WG_IF}
+WG_PORT=${WG_PORT}
+FAKETCP_PORT=${FAKETCP_PORT}
+WG_ADDRESS=${WG_ADDRESS}
+CLIENT_WG_ALLOWED_IP=${CLIENT_WG_ALLOWED_IP}
+WG_MTU=${WG_MTU}
+PUBLIC_IF=${PUBLIC_IF:-auto}
+PHANTUN_TUN_NAME=${PHANTUN_TUN_NAME}
+PHANTUN_SERVER_TUN_PEER_V6=${PHANTUN_SERVER_TUN_PEER_V6}
+PHANTUN_VERSION=${PHANTUN_VERSION}
+PHANTUN_IMAGE=${PHANTUN_IMAGE}
+CONTAINER_NAME=${CONTAINER_NAME}
+IFACE_TXQUEUELEN=${IFACE_TXQUEUELEN}
+
+EOF
+}
+
+run_setup() {
   log "脚本版本：${SCRIPT_VERSION}"
   require_root
   require_debian_like
   apt_install_base
-
-  if [[ "${1:-}" == "--print-key" ]]; then
-    ensure_wireguard_keys
-    exit 0
-  fi
 
   ensure_docker
   ensure_tun_device
@@ -397,6 +514,96 @@ main() {
   start_wireguard
   start_phantun_server
   show_status
+}
+
+interactive_menu() {
+  local answer
+
+  while true; do
+    choose_menu "AWS WireGuard + Phantun 服务端" \
+      "快速安装/重构（使用默认或环境变量）" \
+      "自定义参数后安装/重构" \
+      "仅生成/显示 WireGuard 公钥" \
+      "显示当前参数" \
+      "显示运行状态" \
+      "退出" || exit 1
+
+    case "${MENU_CHOICE}" in
+      0)
+        run_setup
+        pause_ui
+        ;;
+      1)
+        configure_custom
+        print_config
+        read_tty answer "确认按以上参数重构 AWS 服务端？输入 yes 继续: "
+        [[ "${answer}" == "yes" ]] && run_setup || warn "已取消。"
+        pause_ui
+        ;;
+      2)
+        require_root
+        require_debian_like
+        apt_install_base
+        ensure_wireguard_keys
+        pause_ui
+        ;;
+      3)
+        print_config
+        pause_ui
+        ;;
+      4)
+        show_status
+        pause_ui
+        ;;
+      5)
+        exit 0
+        ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<EOF
+用法：
+  sudo bash $0              进入上下键菜单
+  sudo bash $0 menu         进入上下键菜单
+  sudo bash $0 install      直接安装/重构
+  sudo bash $0 --print-key  仅生成/显示服务端 WG 公钥
+  sudo bash $0 status       显示运行状态
+
+常用环境变量：
+  WG_IF=${WG_IF} WG_PORT=${WG_PORT} FAKETCP_PORT=${FAKETCP_PORT}
+  WG_ADDRESS=${WG_ADDRESS} CLIENT_WG_ALLOWED_IP=${CLIENT_WG_ALLOWED_IP}
+  PUBLIC_IF=eth0 PHANTUN_VERSION=${PHANTUN_VERSION}
+EOF
+}
+
+main() {
+  case "${1:-menu}" in
+    menu)
+      interactive_menu
+      ;;
+    install | setup | run)
+      run_setup
+      ;;
+    --print-key | print-key)
+      log "脚本版本：${SCRIPT_VERSION}"
+      require_root
+      require_debian_like
+      apt_install_base
+      ensure_wireguard_keys
+      ;;
+    status)
+      show_status
+      ;;
+    help | -h | --help)
+      usage
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
 }
 
 main "$@"

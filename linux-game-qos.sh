@@ -35,6 +35,88 @@ fatal() {
   exit 1
 }
 
+read_tty() {
+  local __var="$1"
+  local prompt="$2"
+  local input=""
+
+  if [[ -e /dev/tty ]]; then
+    read -r -p "${prompt}" input </dev/tty
+  else
+    read -r -p "${prompt}" input
+  fi
+  printf -v "${__var}" '%s' "${input}"
+}
+
+prompt_value() {
+  local __var="$1"
+  local label="$2"
+  local default_value="${3:-}"
+  local input=""
+
+  read_tty input "${label} [${default_value}]: "
+  printf -v "${__var}" '%s' "${input:-${default_value}}"
+}
+
+pause_ui() {
+  local _
+  read_tty _ "按回车继续..."
+}
+
+choose_menu() {
+  local title="$1"
+  shift
+  local options=("$@")
+  local selected=0
+  local key rest
+
+  if [[ ! -e /dev/tty ]]; then
+    local i choice
+    printf '\n%s\n' "${title}"
+    for i in "${!options[@]}"; do
+      printf '  %s) %s\n' "$((i + 1))" "${options[$i]}"
+    done
+    read_tty choice "请选择 [1-${#options[@]}]: "
+    [[ "${choice}" =~ ^[0-9]+$ ]] || return 1
+    (( choice >= 1 && choice <= ${#options[@]} )) || return 1
+    MENU_CHOICE=$((choice - 1))
+    return 0
+  fi
+
+  while true; do
+    clear >/dev/tty 2>/dev/null || true
+    {
+      printf '%s\n' "========================================"
+      printf '   Linux 游戏优先 QoS\n'
+      printf '   version: %s\n' "${SCRIPT_VERSION}"
+      printf '%s\n' "========================================"
+      printf '使用 ↑/↓ 选择，Enter 确认。\n\n'
+      for key in "${!options[@]}"; do
+        if [[ "${key}" -eq "${selected}" ]]; then
+          printf '  \033[7m> %s\033[0m\n' "${options[$key]}"
+        else
+          printf '    %s\n' "${options[$key]}"
+        fi
+      done
+    } >/dev/tty
+
+    IFS= read -rsn1 key </dev/tty || return 1
+    case "${key}" in
+      $'\x1b')
+        IFS= read -rsn2 -t 0.1 rest </dev/tty || rest=""
+        case "${rest}" in
+          "[A") (( selected > 0 )) && selected=$((selected - 1)) ;;
+          "[B") (( selected < ${#options[@]} - 1 )) && selected=$((selected + 1)) ;;
+        esac
+        ;;
+      "")
+        MENU_CHOICE="${selected}"
+        return 0
+        ;;
+    esac
+  done
+}
+
 require_root() {
   [[ "${EUID}" -eq 0 ]] || fatal "请使用 root 运行：sudo bash $0"
 }
@@ -270,8 +352,10 @@ EOF
 usage() {
   cat <<EOF
 用法：
-  sudo RATE=400mbit GAME_PORTS=8080 bash $0 apply
-  sudo RATE=400mbit GAME_PORTS=8080,30000-30100 bash $0 install
+  sudo bash $0
+  sudo bash $0 menu
+  sudo env RATE=400mbit GAME_PORTS=8080 bash $0 apply
+  sudo env RATE=400mbit GAME_PORTS=8080,30000-30100 bash $0 install
   sudo bash $0 status
   sudo bash $0 clear
 
@@ -292,11 +376,114 @@ usage() {
 EOF
 }
 
+configure_custom() {
+  clear >/dev/tty 2>/dev/null || true
+  log "自定义游戏优先 QoS 参数。直接回车会使用括号内默认值。"
+  prompt_value RATE "整机出口总限速" "${RATE}"
+  prompt_value GAME_RATE "游戏类保底带宽" "${GAME_RATE}"
+  prompt_value OTHER_RATE "其他类保底带宽" "${OTHER_RATE}"
+  prompt_value GAME_PORTS "游戏/高优先端口，支持 8080,30000-30100" "${GAME_PORTS}"
+  prompt_value FAKETCP_PORTS "Phantun FakeTCP 外层端口" "${FAKETCP_PORTS}"
+  prompt_value IFACE "公网网卡，留空自动识别" "${IFACE}"
+  prompt_value TUN_IFACE "隧道内层接口" "${TUN_IFACE}"
+  prompt_value SHAPE_PUBLIC "是否调度公网出口，1/0" "${SHAPE_PUBLIC}"
+  prompt_value SHAPE_TUNNEL "是否调度隧道内层，1/0" "${SHAPE_TUNNEL}"
+  prompt_value GAME_MARK "nft/tc mark" "${GAME_MARK}"
+  prompt_value QOS_TABLE "nftables 表名" "${QOS_TABLE}"
+  prompt_value SERVICE_NAME "systemd 服务名" "${SERVICE_NAME}"
+  SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
+  prompt_value ENV_FILE "环境配置文件" "${ENV_FILE}"
+  prompt_value INSTALL_PATH "脚本安装路径" "${INSTALL_PATH}"
+}
+
+print_config() {
+  cat <<EOF
+
+[当前 QoS 参数]
+RATE=${RATE}
+GAME_RATE=${GAME_RATE}
+OTHER_RATE=${OTHER_RATE}
+GAME_PORTS=${GAME_PORTS}
+FAKETCP_PORTS=${FAKETCP_PORTS}
+IFACE=${IFACE:-auto}
+TUN_IFACE=${TUN_IFACE}
+SHAPE_PUBLIC=${SHAPE_PUBLIC}
+SHAPE_TUNNEL=${SHAPE_TUNNEL}
+GAME_MARK=${GAME_MARK}
+QOS_TABLE=${QOS_TABLE}
+SERVICE_NAME=${SERVICE_NAME}
+ENV_FILE=${ENV_FILE}
+INSTALL_PATH=${INSTALL_PATH}
+
+提示：如果游戏和下载共用同一个 HY2 端口，系统无法区分加密包内业务。
+建议游戏端口放进 GAME_PORTS，下载/其他业务使用别的端口。
+
+EOF
+}
+
+interactive_menu() {
+  local answer
+
+  while true; do
+    choose_menu "Linux 游戏优先 QoS" \
+      "立即应用 QoS（不安装开机自启）" \
+      "安装/更新为开机自启服务" \
+      "自定义参数后安装/更新" \
+      "查看 QoS 状态" \
+      "清除 QoS" \
+      "显示当前参数" \
+      "退出" || exit 1
+
+    case "${MENU_CHOICE}" in
+      0)
+        apply_qos
+        pause_ui
+        ;;
+      1)
+        install_service
+        pause_ui
+        ;;
+      2)
+        configure_custom
+        print_config
+        read_tty answer "确认按以上参数安装/更新 QoS？输入 yes 继续: "
+        [[ "${answer}" == "yes" ]] && install_service || warn "已取消。"
+        pause_ui
+        ;;
+      3)
+        status_qos
+        pause_ui
+        ;;
+      4)
+        clear_qos
+        pause_ui
+        ;;
+      5)
+        print_config
+        pause_ui
+        ;;
+      6)
+        exit 0
+        ;;
+    esac
+  done
+}
+
 main() {
+  case "${1:-menu}" in
+    help | -h | --help)
+      usage
+      return
+      ;;
+  esac
+
   require_root
   require_cmd ip
 
-  case "${1:-apply}" in
+  case "${1:-menu}" in
+    menu)
+      interactive_menu
+      ;;
     apply)
       apply_qos
       ;;

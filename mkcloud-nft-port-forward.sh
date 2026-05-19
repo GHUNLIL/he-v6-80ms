@@ -29,6 +29,88 @@ fatal() {
   exit 1
 }
 
+read_tty() {
+  local __var="$1"
+  local prompt="$2"
+  local input=""
+
+  if [[ -e /dev/tty ]]; then
+    read -r -p "${prompt}" input </dev/tty
+  else
+    read -r -p "${prompt}" input
+  fi
+  printf -v "${__var}" '%s' "${input}"
+}
+
+prompt_value() {
+  local __var="$1"
+  local label="$2"
+  local default_value="${3:-}"
+  local input=""
+
+  read_tty input "${label} [${default_value}]: "
+  printf -v "${__var}" '%s' "${input:-${default_value}}"
+}
+
+pause_ui() {
+  local _
+  read_tty _ "按回车继续..."
+}
+
+choose_menu() {
+  local title="$1"
+  shift
+  local options=("$@")
+  local selected=0
+  local key rest
+
+  if [[ ! -e /dev/tty ]]; then
+    local i choice
+    printf '\n%s\n' "${title}"
+    for i in "${!options[@]}"; do
+      printf '  %s) %s\n' "$((i + 1))" "${options[$i]}"
+    done
+    read_tty choice "请选择 [1-${#options[@]}]: "
+    [[ "${choice}" =~ ^[0-9]+$ ]] || return 1
+    (( choice >= 1 && choice <= ${#options[@]} )) || return 1
+    MENU_CHOICE=$((choice - 1))
+    return 0
+  fi
+
+  while true; do
+    clear >/dev/tty 2>/dev/null || true
+    {
+      printf '%s\n' "========================================"
+      printf '   nftables 端口范围转发管理工具\n'
+      printf '   version: %s\n' "${SCRIPT_VERSION}"
+      printf '%s\n' "========================================"
+      printf '使用 ↑/↓ 选择，Enter 确认。\n\n'
+      for key in "${!options[@]}"; do
+        if [[ "${key}" -eq "${selected}" ]]; then
+          printf '  \033[7m> %s\033[0m\n' "${options[$key]}"
+        else
+          printf '    %s\n' "${options[$key]}"
+        fi
+      done
+    } >/dev/tty
+
+    IFS= read -rsn1 key </dev/tty || return 1
+    case "${key}" in
+      $'\x1b')
+        IFS= read -rsn2 -t 0.1 rest </dev/tty || rest=""
+        case "${rest}" in
+          "[A") (( selected > 0 )) && selected=$((selected - 1)) ;;
+          "[B") (( selected < ${#options[@]} - 1 )) && selected=$((selected + 1)) ;;
+        esac
+        ;;
+      "")
+        MENU_CHOICE="${selected}"
+        return 0
+        ;;
+    esac
+  done
+}
+
 require_root() {
   [[ "${EUID}" -eq 0 ]] || fatal "请使用 root 运行：sudo bash $0"
 }
@@ -377,21 +459,26 @@ add_rule() {
   local local_start local_end target_start target_end rules new_rule
 
   if [[ -z "${local_spec}" ]]; then
-    read -rp "请输入本机端口或范围 [例如 8080 或 30000-30100]: " local_spec
+    read_tty local_spec "请输入本机端口或范围 [例如 8080 或 30000-30100]: "
   fi
 
   if [[ -z "${target_ip}" ]]; then
-    read -rp "请输入目标 IPv4 地址 [默认 ${DEFAULT_TARGET}]: " target_ip
+    read_tty target_ip "请输入目标 IPv4 地址 [默认 ${DEFAULT_TARGET}]: "
     target_ip="${target_ip:-${DEFAULT_TARGET}}"
   fi
 
   if [[ -z "${target_spec}" ]]; then
-    read -rp "请输入目标端口或范围 [默认同本机端口]: " target_spec
+    read_tty target_spec "请输入目标端口或范围 [默认同本机端口]: "
     target_spec="${target_spec:-${local_spec}}"
   fi
 
   if [[ -z "${proto}" ]]; then
-    read -rp "请输入协议 tcp/udp/tcp+udp [默认 tcp+udp]: " proto
+    choose_menu "选择转发协议" "tcp+udp" "tcp" "udp"
+    case "${MENU_CHOICE}" in
+      0) proto="tcp+udp" ;;
+      1) proto="tcp" ;;
+      2) proto="udp" ;;
+    esac
     proto="${proto:-tcp+udp}"
   fi
 
@@ -421,7 +508,7 @@ delete_rule() {
 
   if [[ -z "${index}" ]]; then
     list_rules "${rules}"
-    read -rp "请输入要删除的序号: " index
+    read_tty index "请输入要删除的序号: "
   fi
 
   [[ "${index}" =~ ^[0-9]+$ ]] || fatal "序号必须是数字。"
@@ -447,7 +534,7 @@ clear_rules() {
   local answer="${1:-}"
 
   if [[ "${answer}" != "yes" ]]; then
-    read -rp "确认清空所有转发？输入 yes 继续: " answer
+    read_tty answer "确认清空所有转发？输入 yes 继续: "
   fi
 
   [[ "${answer}" == "yes" ]] || fatal "已取消。"
@@ -477,7 +564,7 @@ print_menu() {
   cat <<'EOF'
 
 ========================================
-   nftables 端口转发管理工具 v2.0
+   nftables 端口范围转发管理工具
 ========================================
   1) 安装/初始化 nftables
   2) 查看现有端口转发
@@ -485,44 +572,88 @@ print_menu() {
   4) 删除端口转发
   5) 一键清空所有转发
   6) 诊断/自检
-  7) 退出
+  7) 自定义默认参数
+  8) 退出
 ========================================
 EOF
 }
 
-menu() {
-  local choice
+configure_custom() {
+  clear >/dev/tty 2>/dev/null || true
+  log "自定义端口转发默认参数。直接回车会使用括号内默认值。"
+  prompt_value CONF_FILE "nftables 配置文件" "${CONF_FILE}"
+  prompt_value TABLE_NAME "nftables 表名" "${TABLE_NAME}"
+  prompt_value DEFAULT_TARGET "默认目标 IPv4" "${DEFAULT_TARGET}"
+  prompt_value WG_IF "WireGuard 接口名" "${WG_IF}"
+  prompt_value WG_CONF "WireGuard 配置文件" "${WG_CONF}"
+  prompt_value WG_MTU "WireGuard MTU" "${WG_MTU}"
+  prompt_value PHANTUN_RST_PORT "Phantun FakeTCP 端口" "${PHANTUN_RST_PORT}"
+  prompt_value MAX_EXPANDED_RULES "最大展开规则数" "${MAX_EXPANDED_RULES}"
+}
 
+print_config() {
+  cat <<EOF
+
+[当前端口转发参数]
+CONF_FILE=${CONF_FILE}
+TABLE_NAME=${TABLE_NAME}
+DEFAULT_TARGET=${DEFAULT_TARGET}
+WG_IF=${WG_IF}
+WG_CONF=${WG_CONF}
+WG_MTU=${WG_MTU}
+PHANTUN_RST_PORT=${PHANTUN_RST_PORT}
+MAX_EXPANDED_RULES=${MAX_EXPANDED_RULES}
+
+EOF
+}
+
+menu() {
   while true; do
-    print_menu
-    read -rp "请选择操作 [1-7]: " choice
-    case "${choice}" in
-      1)
+    choose_menu "nftables 端口范围转发管理工具" \
+      "安装/初始化 nftables" \
+      "查看现有端口转发" \
+      "新增端口转发" \
+      "删除端口转发" \
+      "一键清空所有转发" \
+      "诊断/自检" \
+      "自定义默认参数" \
+      "退出" || exit 1
+
+    case "${MENU_CHOICE}" in
+      0)
         ensure_nftables
         restore_phantun_rst_guard
         ensure_wg_mtu
         log "初始化完成。"
+        pause_ui
+        ;;
+      1)
+        list_rules "$(current_rules || true)"
+        pause_ui
         ;;
       2)
-        list_rules "$(current_rules || true)"
+        add_rule
+        pause_ui
         ;;
       3)
-        add_rule
+        delete_rule
+        pause_ui
         ;;
       4)
-        delete_rule
+        clear_rules
+        pause_ui
         ;;
       5)
-        clear_rules
+        diagnose
+        pause_ui
         ;;
       6)
-        diagnose
+        configure_custom
+        print_config
+        pause_ui
         ;;
       7)
         exit 0
-        ;;
-      *)
-        warn "无效选择。"
         ;;
     esac
   done
@@ -546,6 +677,13 @@ EOF
 }
 
 main() {
+  case "${1:-menu}" in
+    help | -h | --help)
+      usage
+      return
+      ;;
+  esac
+
   require_root
   require_cmd ip
   require_cmd awk
